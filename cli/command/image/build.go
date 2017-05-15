@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sync"
+	"time"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/cli/cli"
@@ -28,6 +30,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/versions"
 	"github.com/docker/docker/client/session"
+	"github.com/docker/docker/client/session/filesync"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/docker/pkg/progress"
@@ -38,6 +41,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"golang.org/x/net/context"
+	"golang.org/x/time/rate"
 )
 
 type buildOptions struct {
@@ -70,6 +74,7 @@ type buildOptions struct {
 	squash         bool
 	target         string
 	imageIDFile    string
+	stream         bool
 }
 
 // dockerfileFromStdin returns true when the user specified that the Dockerfile
@@ -141,6 +146,10 @@ func NewBuildCommand(dockerCli *command.DockerCli) *cobra.Command {
 	flags.BoolVar(&options.squash, "squash", false, "Squash newly built layers into a single new layer")
 	flags.SetAnnotation("squash", "experimental", nil)
 	flags.SetAnnotation("squash", "version", []string{"1.25"})
+
+	flags.BoolVar(&options.stream, "stream", false, "Stream attaches to server to negotiate build context")
+	flags.SetAnnotation("stream", "experimental", nil)
+	flags.SetAnnotation("stream", "version", []string{"1.30"})
 
 	return cmd
 }
@@ -225,7 +234,7 @@ func runBuild(dockerCli *command.DockerCli, options buildOptions) error {
 		contextDir = tempDir
 	}
 
-	if buildCtx == nil {
+	if buildCtx == nil && !options.stream {
 		excludes, err := build.ReadDockerignore(contextDir)
 		if err != nil {
 			return err
@@ -264,6 +273,15 @@ func runBuild(dockerCli *command.DockerCli, options buildOptions) error {
 		}
 	}
 
+	if options.stream && dockerfileCtx == nil {
+		f, err := os.Open(relDockerfile)
+		if err != nil {
+			return errors.Wrapf(err, "failed to open %s", relDockerfile)
+		}
+		defer f.Close()
+		dockerfileCtx = f
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -272,9 +290,17 @@ func runBuild(dockerCli *command.DockerCli, options buildOptions) error {
 		translator := func(ctx context.Context, ref reference.NamedTagged) (reference.Canonical, error) {
 			return TrustedReference(ctx, dockerCli, ref, nil)
 		}
-		// Wrap the tar archive to replace the Dockerfile entry with the rewritten
-		// Dockerfile which uses trusted pulls.
-		buildCtx = replaceDockerfileTarWrapper(ctx, buildCtx, relDockerfile, translator, &resolvedTags)
+		if buildCtx != nil {
+			// Wrap the tar archive to replace the Dockerfile entry with the rewritten
+			// Dockerfile which uses trusted pulls.
+			buildCtx = replaceDockerfileTarWrapper(ctx, buildCtx, relDockerfile, translator, &resolvedTags)
+		} else if dockerfileCtx != nil {
+			newDockerfile, _, err := rewriteDockerfileFrom(context.Background(), dockerfileCtx, translator)
+			if err != nil {
+				return err
+			}
+			dockerfileCtx = ioutil.NopCloser(bytes.NewBuffer(newDockerfile))
+		}
 	}
 
 	// Setup an upload progress bar
@@ -298,7 +324,44 @@ func runBuild(dockerCli *command.DockerCli, options buildOptions) error {
 		}
 	}
 
-	var body io.Reader = progress.NewProgressReader(buildCtx, progressOutput, 0, "", "Sending build context to Docker daemon")
+	var body io.Reader
+	if buildCtx != nil && !options.stream {
+		body = progress.NewProgressReader(buildCtx, progressOutput, 0, "", "Sending build context to Docker daemon")
+	}
+
+	if options.stream {
+		excludes, err := build.ReadDockerignore(contextDir)
+		if err != nil {
+			return err
+		}
+
+		p := &sizeProgress{out: progressOutput, action: "Streaming build context to Docker daemon"}
+
+		workdirProvider := filesync.NewFSSyncProvider(contextDir, excludes)
+		s.Allow(workdirProvider)
+
+		syncDone := make(chan error)
+
+		// this will be replaced on parallel build jobs. keep the current
+		// progressbar for now
+		if snpc, ok := workdirProvider.(interface {
+			SetNextProgressCallback(func(int, bool), chan error)
+		}); ok {
+			snpc.SetNextProgressCallback(p.update, syncDone)
+		}
+
+		buf := newBufferedWriter(syncDone, buildBuff)
+		defer func() {
+			select {
+			case <-buf.flushed:
+			case <-ctx.Done():
+			}
+		}()
+		buildBuff = buf
+
+		remote = "client-session"
+		body = buildCtx
+	}
 
 	authConfigs, _ := dockerCli.GetAllCredentials()
 	buildOptions := types.ImageBuildOptions{
@@ -348,6 +411,7 @@ func runBuild(dockerCli *command.DockerCli, options buildOptions) error {
 		if options.quiet {
 			fmt.Fprintf(dockerCli.Err(), "%s", progBuff)
 		}
+		cancel()
 		return err
 	}
 	defer response.Body.Close()
@@ -415,34 +479,84 @@ func runBuild(dockerCli *command.DockerCli, options buildOptions) error {
 	return nil
 }
 
+type sizeProgress struct {
+	out     progress.Output
+	action  string
+	limiter *rate.Limiter
+}
+
+func (sp *sizeProgress) update(size int, last bool) {
+	if sp.limiter == nil {
+		sp.limiter = rate.NewLimiter(rate.Every(100*time.Millisecond), 1)
+	}
+	if last || sp.limiter.Allow() {
+		sp.out.WriteProgress(progress.Progress{Action: sp.action, Current: int64(size), LastUpdate: last})
+	}
+}
+
+type bufferedWriter struct {
+	done chan error
+	io.Writer
+	buf     *bytes.Buffer
+	flushed chan struct{}
+	mu      sync.Mutex
+}
+
+func newBufferedWriter(done chan error, w io.Writer) *bufferedWriter {
+	bw := &bufferedWriter{done: done, Writer: w, buf: new(bytes.Buffer), flushed: make(chan struct{})}
+	go func() {
+		<-done
+		bw.flushBuffer()
+	}()
+	return bw
+}
+
+func (bw *bufferedWriter) Write(dt []byte) (int, error) {
+	select {
+	case <-bw.done:
+		bw.flushBuffer()
+		return bw.Writer.Write(dt)
+	default:
+		return bw.buf.Write(dt)
+	}
+}
+
+func (bw *bufferedWriter) flushBuffer() {
+	bw.mu.Lock()
+	select {
+	case <-bw.flushed:
+	default:
+		bw.Writer.Write(bw.buf.Bytes())
+		close(bw.flushed)
+	}
+	bw.mu.Unlock()
+}
+
 func getBuildSharedKey(dir string) (string, error) {
-	// build session is hash of build dir with node based randomness
-	sessionFile := filepath.Join(cliconfig.Dir(), ".buildsharedkey")
-	if _, err := os.Lstat(sessionFile); err != nil {
-		if os.IsNotExist(err) {
-			b := make([]byte, 32)
-			if _, err := rand.Read(b); err != nil {
-				return "", err
+	dt := []byte(cliconfig.Dir()) // if no access to config dir then only use path
+	if err := os.MkdirAll(cliconfig.Dir(), 0700); err == nil {
+		// build session is hash of build dir with node based randomness
+		sessionFile := filepath.Join(cliconfig.Dir(), ".buildsharedkey")
+		if _, err := os.Lstat(sessionFile); err != nil {
+			if os.IsNotExist(err) {
+				b := make([]byte, 32)
+				if _, err := rand.Read(b); err != nil {
+					return "", err
+				}
+				if err := ioutil.WriteFile(sessionFile, []byte(hex.EncodeToString(b)), 0600); err != nil {
+					return "", err
+				}
 			}
-			if err := os.MkdirAll(cliconfig.Dir(), 0600); err != nil {
-				return "", err
-			}
-			if err := ioutil.WriteFile(sessionFile, []byte(hex.EncodeToString(b)), 0600); err != nil {
-				return "", err
-			}
-		} else {
-			return "", err
+		}
+
+		dt, err = ioutil.ReadFile(sessionFile)
+		if err != nil {
+			return "", errors.Wrapf(err, "failed to read %s", sessionFile)
+
 		}
 	}
-
-	dt, err := ioutil.ReadFile(sessionFile)
-	if err != nil {
-		return "", errors.Wrapf(err, "failed to read %s", sessionFile)
-
-	}
-
 	s := sha256.Sum256([]byte(fmt.Sprintf("%s:%s", dt, dir)))
-	return hex.EncodeToString(s[:]), nil // add randomness to force recheck
+	return hex.EncodeToString(s[:]), nil
 }
 
 func isLocalDir(c string) bool {
