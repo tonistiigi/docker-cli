@@ -4,22 +4,30 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 
+	"github.com/Sirupsen/logrus"
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/command/image/build"
+	cliconfig "github.com/docker/cli/cli/config"
 	"github.com/docker/cli/opts"
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/versions"
+	"github.com/docker/docker/client/session"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/docker/pkg/progress"
@@ -153,6 +161,10 @@ func (out *lastProgressOutput) WriteProgress(prog progress.Progress) error {
 	return out.output.WriteProgress(prog)
 }
 
+func isSessionSupported(dockerCli *command.DockerCli) bool {
+	return dockerCli.ServerInfo().HasExperimental && versions.GreaterThanOrEqualTo(dockerCli.Client().ClientVersion(), "1.30")
+}
+
 // nolint: gocyclo
 func runBuild(dockerCli *command.DockerCli, options buildOptions) error {
 	var (
@@ -164,6 +176,7 @@ func runBuild(dockerCli *command.DockerCli, options buildOptions) error {
 		relDockerfile string
 		progBuff      io.Writer
 		buildBuff     io.Writer
+		remote        string
 	)
 
 	if options.dockerfileFromStdin() {
@@ -251,7 +264,8 @@ func runBuild(dockerCli *command.DockerCli, options buildOptions) error {
 		}
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	var resolvedTags []*resolvedTag
 	if command.IsTrusted() {
@@ -267,6 +281,21 @@ func runBuild(dockerCli *command.DockerCli, options buildOptions) error {
 	progressOutput := streamformatter.NewProgressOutput(progBuff)
 	if !dockerCli.Out().IsTerminal() {
 		progressOutput = &lastProgressOutput{output: progressOutput}
+	}
+
+	if dockerfileCtx != nil && buildCtx == nil {
+		buildCtx = dockerfileCtx
+	}
+	var s *session.Session
+	if isSessionSupported(dockerCli) {
+		sharedKey, err := getBuildSharedKey(contextDir)
+		if err != nil {
+			return errors.Wrap(err, "failed to get build shared key")
+		}
+		s, err = session.NewSession(filepath.Base(contextDir), sharedKey)
+		if err != nil {
+			return errors.Wrap(err, "failed to create session")
+		}
 	}
 
 	var body io.Reader = progress.NewProgressReader(buildCtx, progressOutput, 0, "", "Sending build context to Docker daemon")
@@ -300,6 +329,18 @@ func runBuild(dockerCli *command.DockerCli, options buildOptions) error {
 		Squash:         options.squash,
 		ExtraHosts:     options.extraHosts.GetAll(),
 		Target:         options.target,
+		RemoteContext:  remote,
+	}
+
+	if s != nil {
+		go func() {
+			logrus.Debugf("running session: %v", s.UUID())
+			if err := s.Run(ctx, dockerCli.Client().DialSession); err != nil {
+				logrus.Error(err)
+				cancel()
+			}
+		}()
+		buildOptions.SessionID = s.UUID()
 	}
 
 	response, err := dockerCli.Client().ImageBuild(ctx, body, buildOptions)
@@ -372,6 +413,36 @@ func runBuild(dockerCli *command.DockerCli, options buildOptions) error {
 	}
 
 	return nil
+}
+
+func getBuildSharedKey(dir string) (string, error) {
+	// build session is hash of build dir with node based randomness
+	sessionFile := filepath.Join(cliconfig.Dir(), ".buildsharedkey")
+	if _, err := os.Lstat(sessionFile); err != nil {
+		if os.IsNotExist(err) {
+			b := make([]byte, 32)
+			if _, err := rand.Read(b); err != nil {
+				return "", err
+			}
+			if err := os.MkdirAll(cliconfig.Dir(), 0600); err != nil {
+				return "", err
+			}
+			if err := ioutil.WriteFile(sessionFile, []byte(hex.EncodeToString(b)), 0600); err != nil {
+				return "", err
+			}
+		} else {
+			return "", err
+		}
+	}
+
+	dt, err := ioutil.ReadFile(sessionFile)
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to read %s", sessionFile)
+
+	}
+
+	s := sha256.Sum256([]byte(fmt.Sprintf("%s:%s", dt, dir)))
+	return hex.EncodeToString(s[:]), nil // add randomness to force recheck
 }
 
 func isLocalDir(c string) bool {
