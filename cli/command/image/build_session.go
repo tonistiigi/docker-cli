@@ -21,6 +21,7 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/filesync"
 	"github.com/pkg/errors"
+	"golang.org/x/net/context"
 	"golang.org/x/time/rate"
 )
 
@@ -37,7 +38,7 @@ func trySession(dockerCli command.Cli, contextDir string) (*session.Session, err
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to get build shared key")
 		}
-		s, err = session.NewSession(filepath.Base(contextDir), sharedKey)
+		s, err = session.NewSession(context.TODO(), filepath.Base(contextDir), sharedKey)
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to create session")
 		}
@@ -150,4 +151,12 @@ func tryNodeIdentifier() string {
 		}
 	}
 	return out
+}
+
+func defaultSessionName() string {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "unknown"
+	}
+	return filepath.Base(wd)
 }
