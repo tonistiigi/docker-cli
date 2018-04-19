@@ -1,20 +1,27 @@
 package image
 
 import (
-	"io"
+	"encoding/json"
 	"os"
 	"path/filepath"
 
+	"github.com/containerd/console"
+	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/opts"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/docker/pkg/urlutil"
+	controlapi "github.com/moby/buildkit/api/services/control"
+	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/session/auth/authprovider"
 	"github.com/moby/buildkit/session/filesync"
 	"github.com/moby/buildkit/util/appcontext"
+	"github.com/moby/buildkit/util/progress/progressui"
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/fsutil"
+	"golang.org/x/net/context"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -118,7 +125,28 @@ func runBuildBuildKit(dockerCli command.Cli, options buildOptions) error {
 		}
 		defer response.Body.Close()
 
-		if _, err := io.Copy(os.Stdout, response.Body); err != nil {
+		t := newTracer()
+		var auxCb func(*json.RawMessage)
+		if c, err := console.ConsoleFromFile(os.Stderr); err == nil {
+			// not using shared context to not disrupt display but let is finish reporting errors
+			auxCb = t.write
+			eg.Go(func() error {
+				return progressui.DisplaySolveStatus(context.TODO(), c, t.displayCh)
+			})
+			defer close(t.displayCh)
+		}
+		err = jsonmessage.DisplayJSONMessagesStream(response.Body, os.Stdout, dockerCli.Out().FD(), dockerCli.Out().IsTerminal(), auxCb)
+		if err != nil {
+			if jerr, ok := err.(*jsonmessage.JSONError); ok {
+				// If no error code is set, default to 1
+				if jerr.Code == 0 {
+					jerr.Code = 1
+				}
+				// if options.quiet {
+				// 	fmt.Fprintf(dockerCli.Err(), "%s%s", progBuff, buildBuff)
+				// }
+				return cli.StatusError{Status: jerr.Message, StatusCode: jerr.Code}
+			}
 			return err
 		}
 
@@ -132,4 +160,61 @@ func resetUIDAndGID(s *fsutil.Stat) bool {
 	s.Uid = uint32(0)
 	s.Gid = uint32(0)
 	return true
+}
+
+type tracer struct {
+	displayCh chan *client.SolveStatus
+}
+
+func newTracer() *tracer {
+	return &tracer{
+		displayCh: make(chan *client.SolveStatus),
+	}
+}
+
+func (t *tracer) write(aux *json.RawMessage) {
+	var resp controlapi.StatusResponse
+
+	var dt []byte
+	if err := json.Unmarshal(*aux, &dt); err != nil {
+		return
+	}
+	if err := (&resp).Unmarshal(dt); err != nil {
+		return
+	}
+
+	s := client.SolveStatus{}
+	for _, v := range resp.Vertexes {
+		s.Vertexes = append(s.Vertexes, &client.Vertex{
+			Digest:    v.Digest,
+			Inputs:    v.Inputs,
+			Name:      v.Name,
+			Started:   v.Started,
+			Completed: v.Completed,
+			Error:     v.Error,
+			Cached:    v.Cached,
+		})
+	}
+	for _, v := range resp.Statuses {
+		s.Statuses = append(s.Statuses, &client.VertexStatus{
+			ID:        v.ID,
+			Vertex:    v.Vertex,
+			Name:      v.Name,
+			Total:     v.Total,
+			Current:   v.Current,
+			Timestamp: v.Timestamp,
+			Started:   v.Started,
+			Completed: v.Completed,
+		})
+	}
+	for _, v := range resp.Logs {
+		s.Logs = append(s.Logs, &client.VertexLog{
+			Vertex:    v.Vertex,
+			Stream:    int(v.Stream),
+			Data:      v.Msg,
+			Timestamp: v.Timestamp,
+		})
+	}
+
+	t.displayCh <- &s
 }
