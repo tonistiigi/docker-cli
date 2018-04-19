@@ -12,6 +12,7 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/pkg/jsonmessage"
+	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/docker/pkg/urlutil"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/client"
@@ -77,13 +78,15 @@ func runBuildBuildKit(dockerCli command.Cli, options buildOptions) error {
 	eg, ctx := errgroup.WithContext(ctx)
 
 	eg.Go(func() error {
-		return s.Run(ctx, dockerCli.Client().DialSession)
+		return s.Run(context.TODO(), dockerCli.Client().DialSession)
 	})
 
 	eg.Go(func() error {
 		defer func() { // make sure the Status ends cleanly on build errors
 			s.Close()
 		}()
+
+		buildID := stringid.GenerateRandomID()
 
 		configFile := dockerCli.ConfigFile()
 		buildOptions := types.ImageBuildOptions{
@@ -117,13 +120,25 @@ func runBuildBuildKit(dockerCli command.Cli, options buildOptions) error {
 			RemoteContext: remote,
 			Platform:      options.platform,
 			SessionID:     "buildkit:" + s.ID(),
+			BuildID:       buildID,
 		}
 
-		response, err := dockerCli.Client().ImageBuild(ctx, nil, buildOptions)
+		response, err := dockerCli.Client().ImageBuild(context.Background(), nil, buildOptions)
 		if err != nil {
 			return err
 		}
 		defer response.Body.Close()
+
+		done := make(chan struct{})
+		defer close(done)
+		eg.Go(func() error {
+			select {
+			case <-ctx.Done():
+				return dockerCli.Client().BuildCancel(context.TODO(), buildID)
+			case <-done:
+			}
+			return nil
+		})
 
 		t := newTracer()
 		var auxCb func(*json.RawMessage)
