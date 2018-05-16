@@ -1,6 +1,7 @@
 package client // import "github.com/docker/docker/client"
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -8,8 +9,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-
-	"golang.org/x/net/context"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -137,5 +136,6 @@ func (cli *Client) imageBuildOptionsToQuery(options types.ImageBuildOptions) (ur
 	if options.BuildID != "" {
 		query.Set("buildid", options.BuildID)
 	}
+	query.Set("version", string(options.Version))
 	return query, nil
 }
