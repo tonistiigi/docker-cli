@@ -2,6 +2,7 @@ package image
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -37,13 +38,13 @@ func runBuildBuildKit(dockerCli command.Cli, options buildOptions) error {
 		return errors.Errorf("buildkit not supported by daemon")
 	}
 
-	remote := clientSessionRemote
-	local := false
+	var remote string
+	var body io.Reader
 	switch {
 	case options.contextFromStdin():
-		return errors.Errorf("stdin not implemented")
+		body = os.Stdin
 	case isLocalDir(options.context):
-		local = true
+		remote = clientSessionRemote
 	case urlutil.IsGitURL(options.context):
 		remote = options.context
 	case urlutil.IsURL(options.context):
@@ -59,7 +60,7 @@ func runBuildBuildKit(dockerCli command.Cli, options buildOptions) error {
 	// 	statusContext = opentracing.ContextWithSpan(statusContext, span)
 	// }
 
-	if local {
+	if remote == clientSessionRemote {
 		s.Allow(filesync.NewFSSyncProvider([]filesync.SyncedDir{
 			{
 				Name: "context",
@@ -119,11 +120,12 @@ func runBuildBuildKit(dockerCli command.Cli, options buildOptions) error {
 			Target:        options.target,
 			RemoteContext: remote,
 			Platform:      options.platform,
-			SessionID:     "buildkit:" + s.ID(),
+			SessionID:     s.ID(),
+			Version:       types.BuilderBuildKit,
 			BuildID:       buildID,
 		}
 
-		response, err := dockerCli.Client().ImageBuild(context.Background(), nil, buildOptions)
+		response, err := dockerCli.Client().ImageBuild(context.Background(), body, buildOptions)
 		if err != nil {
 			return err
 		}
@@ -141,7 +143,7 @@ func runBuildBuildKit(dockerCli command.Cli, options buildOptions) error {
 		})
 
 		t := newTracer()
-		var auxCb func(*json.RawMessage)
+		var auxCb func(jsonmessage.JSONMessage)
 		if c, err := console.ConsoleFromFile(os.Stderr); err == nil {
 			// not using shared context to not disrupt display but let is finish reporting errors
 			auxCb = t.write
@@ -187,11 +189,11 @@ func newTracer() *tracer {
 	}
 }
 
-func (t *tracer) write(aux *json.RawMessage) {
+func (t *tracer) write(msg jsonmessage.JSONMessage) {
 	var resp controlapi.StatusResponse
 
 	var dt []byte
-	if err := json.Unmarshal(*aux, &dt); err != nil {
+	if err := json.Unmarshal(*msg.Aux, &dt); err != nil {
 		return
 	}
 	if err := (&resp).Unmarshal(dt); err != nil {
