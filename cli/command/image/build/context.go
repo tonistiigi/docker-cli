@@ -109,7 +109,7 @@ func DetectArchiveReader(input io.ReadCloser) (rc io.ReadCloser, isArchive bool,
 // name specified by DefaultDockerfileName and returns the path to the
 // temporary directory containing the Dockerfile.
 func WriteTempDockerfile(rc io.ReadCloser) (dockerfileDir string, err error) {
-	dockerfileDir, err = ioutil.TempDir("", "docker-build-context-")
+	dockerfileDir, err = ioutil.TempDir("", "docker-build-tempdockerfile-")
 	if err != nil {
 		return "", errors.Errorf("unable to create temporary context directory: %v", err)
 	}
