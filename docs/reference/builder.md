@@ -121,6 +121,28 @@ registries.
 When you're done with your build, you're ready to look into [*Pushing a
 repository to its registry*](https://docs.docker.com/engine/tutorials/dockerrepos/#/contributing-to-docker-hub).
 
+
+## BuildKit
+
+Starting from version 18.09 Docker supports a new backend for executing your 
+build that is provided by [moby/buildkit](https://github.com/moby/buildkit) 
+project. BuildKit backend provides many benefits compared to the old 
+implementation. For example, BuildKit can:
+
+* Detect and skip executing unused build stages
+* Parallelize building independent build stages
+* Incrementally transfer only the changed files in your build context between builds
+* Detect and skip transferring unused files in your build context
+* Use external Dockerfile implementations with many new features
+* Avoid leaking dangling images and containers to the rest of the API
+* Prioritize your build cache for automatic pruning
+
+To use the BuildKit backend in 18.09, you need to set an environment variable 
+`DOCKER_BUILDKIT=1` on the CLI before invoking `docker build`.
+
+To learn about the experimental Dockerfile syntax available to BuildKit based 
+builds [refer to the docs in BuildKit repository](https://github.com/moby/buildkit/blob/master/frontend/dockerfile/docs/experimental.md).
+
 ## Format
 
 Here is the format of the `Dockerfile`:
@@ -226,7 +248,60 @@ following lines are all treated identically:
 
 The following parser directive is supported:
 
+* `syntax`
 * `escape`
+
+## syntax
+
+    # syntax=[remote image reference]
+
+For example:
+
+    # syntax=docker/dockerfile
+    # syntax=docker/dockerfile:1.0
+    # syntax=docker/dockerfile:1.0.0-experimental
+    # syntax=example.com/user/repo:tag@sha256:abcdef...
+    
+This feature is only enabled if [BuildKit](#buildkit) backend is used.
+
+Syntax directive defines the location of the Dockerfile builder that is used for 
+building the current Dockerfile. BuildKit backend allows to seamlessly use 
+external implementations of builders that are distributed as Docker images and 
+execute inside a container sandbox environment.
+
+Using a custom Dockerfile implementation allows you to:
+  - Automatically get bugfixes without updating the daemon
+  - Make sure all users are using the same implementation to build your Dockerfile
+  - Use the latest features without updating the daemon
+  - Try out new experimental or third party features
+
+### Official releases
+
+Docker distributes official versions of the images that can be used for building 
+Dockerfiles under `docker/dockerfile` repository on Docker Hub. There are two 
+channels where new images are released: stable and experimental. 
+
+Stable channel follows semantic versioning. For example:
+
+  - docker/dockerfile:1.1.0 - only allow immutable version 1.1.0
+  - docker/dockerfile:1.1 - allow versions 1.1.*
+  - docker/dockerfile:1 - allow versions 1.*.*
+  - docker/dockerfile:latest - latest release on stable channel
+
+The experimental channel uses incrementing versioning with the major and minor 
+component from the stable channel on the time of the release. For example:
+
+  - docker/dockerfile:1.1.1-experimental - only allow immutable version 1.1.1-experimental
+  - docker/dockerfile:1.1-experimental - latest experimental releases after 1.1
+  - docker/dockerfile:experimental - latest release on experimental channel
+
+You should choose a channel that best fits your needs. If you only want 
+bugfixes, you should use `docker/dockerfile:1.0` while if you're going to use 
+experimental features, you should use the experimental channel. If you are using 
+the experimental channel, the new releases may not be backward compatible, so it 
+is recommended to use an immutable full version variant.
+
+For master builds and nightly feature releases refer to the description in [the source repository](https://github.com/moby/buildkit/blob/master/README.md).
 
 ## escape
 
@@ -1623,6 +1698,31 @@ RUN echo "Hello World"
 When building this Dockerfile, the `HTTP_PROXY` is preserved in the
 `docker history`, and changing its value invalidates the build cache.
 
+### Automatic platform ARGs in the global scope
+
+This feature is only available when using  [BuildKit](#buildkit) backend.
+
+Docker has a set of predefined `ARG` variables that are automatically defined with the information based on the current platform of the node performing the build and the platform of the build result specified with the `--platform` flag on `docker build`.
+
+* TARGETPLATFORM - platform of the build result. Eg `linux/amd64`, `linux/arm/v7`, `windows/amd64`.
+* TARGETOS - OS component of TARGETPLATFORM
+* TARGETARCH - architecture component of TARGETPLATFORM
+* TARGETVARIANT - variant component of TARGETPLATFORM
+* BUILDPLATFORM - platform of the node performing the build.
+* BUILDOS - OS component of BUILDPLATFORM
+* BUILDARCH - OS component of BUILDPLATFORM
+* BUILDVARIANT - - OS component of BUILDPLATFORM
+
+These arguments are defined in the global scope so are not automatically available inside build stages or for your `RUN` commands. To expose one of these arguments inside the build stage redefine it without value.
+
+For example:
+
+```
+FROM alpine
+ARG TARGETPLATFORM
+RUN echo "I'm building for $TARGETPLATFORM"
+```
+
 ### Impact on build caching
 
 `ARG` variables are not persisted into the built image as `ENV` variables are.
@@ -1930,6 +2030,14 @@ The `SHELL` instruction can also be used on Linux should an alternate shell be
 required such as `zsh`, `csh`, `tcsh` and others.
 
 The `SHELL` feature was added in Docker 1.12.
+
+## Experimental features
+
+This feature is only available when using  [BuildKit](#buildkit) backend.
+
+Docker build supports experimental features like cache mounts, build secrets and
+ssh forwarding that are enabled by using an external implementation of the 
+builder with a syntax directive. To learn about these features, [refer to the docs in BuildKit repository](https://github.com/moby/buildkit/blob/master/frontend/dockerfile/docs/experimental.md).
 
 ## Dockerfile examples
 
